@@ -1,69 +1,76 @@
-# Installation
+# Installation from the turnkey zip
 
-Tested on Debian/Ubuntu.  Adapt paths as needed for other distros.
+This build is intended to run directly from the unzipped directory.
 
 ## Requirements
 
-- Python 3.11 or newer (`python3 --version`)
-- git
+- Python 3.11 or newer
+- Python venv support (`python3-venv` on Debian/Ubuntu)
+- Network reachability to the IPSC upstream master and HBP master
 
-## 1 — Clone and enter the repo
-Start in a standard unprivileged user's home directory that will own ipsc2hbp. This is generally the standard user with sudo capability you created when the os was installed.
+## 1. Unzip
 
-```
-git clone https://github.com/n0mjs710/ipsc2hbp.git
-cd ipsc2hbp
-```
+Example location:
 
-## 2 — Create a virtual environment and install dependencies
-
-```
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
+```bash
+cd /opt/NC4ES-Bridges
+unzip ipsc2hbp-peer-turnkey.zip
+cd ipsc2hbp-peer
 ```
 
-## 3 — Create your configuration file
+## 2. Create the virtual environment
 
-```
-cp ipsc2hbp.toml.sample ipsc2hbp.toml
-```
-
-Edit `ipsc2hbp.toml` and fill in your IPSC and HBP settings.
-The sample file has comments explaining each option.
-
-## 4 — Test it manually (optional but recommended)
-
-```
-venv/bin/python ipsc2hbp.py --log-level DEBUG
+```bash
+./setup_venv.sh
 ```
 
-Hit Ctrl-C to stop.
+This creates `venv/` and installs `requirements.txt`.
 
-## 5 — Install the systemd service
+## 3. Review the config
 
-Open `ipsc2hbp.service` in your editor and replace the two placeholders:
+The default runtime config is `ipsc2hbp.toml`. It uses the PEER-mode structure:
 
-- `__USER__` → your username (e.g. `cort`)
-- `__REPO__` → the full path to the cloned repo (e.g. `/home/cort/ipsc2hbp`)
+```toml
+[ipsc]
+mode = "PEER"
 
-Then copy it into place and enable it:
-
-```
-sudo cp ipsc2hbp.service /lib/systemd/system/ipsc2hbp.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now ipsc2hbp
+[ipsc_upstream]
+master_ip = "..."
+master_port = 55002
 ```
 
-## 6 — Check the logs
+The original MASTER mode is still available by starting from `ipsc2hbp.master.toml.sample`.
 
+## 4. Test manually
+
+```bash
+./run.sh
 ```
+
+For first-time hardware testing, raw packet logging is often useful:
+
+```bash
+venv/bin/python ipsc2hbp.py -c ipsc2hbp.toml --wire
+```
+
+## 5. Install as a service
+
+```bash
+sudo ./install_systemd.sh
+sudo systemctl status ipsc2hbp
 journalctl -u ipsc2hbp -f
 ```
 
-## Updating
+To force a specific service user:
 
+```bash
+sudo ./install_systemd.sh radio
 ```
-git pull
-venv/bin/pip install -r requirements.txt   # pick up any new deps
+
+## Updating config
+
+Edit `ipsc2hbp.toml`, then restart:
+
+```bash
 sudo systemctl restart ipsc2hbp
 ```

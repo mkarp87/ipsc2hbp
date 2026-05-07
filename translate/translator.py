@@ -34,9 +34,12 @@ Superframe mapping (6-frame cycle, position resets on each VOICE_HEAD):
   position 5   → HBPF_FRAMETYPE_VOICE | 4, EMBED = BURST_F + NULL_EMB_LC
 """
 
+import asyncio
 import logging
 import os
 import struct
+from collections import deque
+from random import randint
 from time import time
 
 from bitarray import bitarray
@@ -50,7 +53,7 @@ from ipsc.const import (
     GROUP_VOICE,
     VOICE_HEAD, VOICE_TERM, SLOT1_VOICE, SLOT2_VOICE,
     TS_CALL_MSK, END_MSK,
-    GV_SRC_SUB_OFF, GV_DST_GROUP_OFF,
+    GV_SRC_SUB_OFF, GV_DST_GROUP_OFF, GV_IPSC_SEQ_OFF,
 )
 from hbp.const import (
     HBPF_DMRD,
@@ -152,7 +155,8 @@ class CallTranslator:
         self._ipsc          = None
         self._hbp           = None
         self._repeater_id_b = cfg.hbp_repeater_id.to_bytes(4, 'big')
-        self._master_id_b   = cfg.ipsc_master_id.to_bytes(4, 'big')
+        ipsc_source_id     = getattr(cfg, 'ipsc_source_id', cfg.ipsc_master_id)
+        self._master_id_b   = ipsc_source_id.to_bytes(4, 'big')
 
         # Outbound call state (IPSC → HBP) — keyed by timeslot (1 or 2)
         self._out_stream_id = {1: None, 2: None}  # 4 random bytes, new per call
@@ -166,8 +170,42 @@ class CallTranslator:
         self._in_emb_lc     = {1: None, 2: None}  # dict {1–4: bitarray(32)} from bptc.encode_emblc
         self._in_stream_id  = {1: 0, 2: 0}        # byte 5: call stream ID, constant per call
         self._in_stream_ctr = 0                   # increments once per call (shared across TS)
+        self._in_hbp_stream = {1: None, 2: None}  # 4-byte HBP stream currently mapped to IPSC
+        self._in_src_sub    = {1: None, 2: None}  # 3-byte source currently mapped to IPSC
+        self._in_dst_group  = {1: None, 2: None}  # 3-byte destination currently mapped to IPSC
+        self._in_last_head  = {1: 0.0, 2: 0.0}   # last HBP VOICE_HEAD time for duplicate debounce
         self._in_rtp_seq    = {1: 0, 2: 0}        # RTP sequence in GV header
         self._in_rtp_ts     = {1: 0, 2: 0}        # RTP timestamp; increments 480/frame
+
+        # Original IPSC_Bridge-style slot arbitration.  Inbound IPSC traffic marks
+        # the timeslot busy; HBP-to-IPSC traffic is not transmitted while the slot
+        # is busy.  This avoids using broad src/tg suppression for normal
+        # direction changes.
+        self._ipsc_busy_last = {1: 0.0, 2: 0.0}
+
+        # Per-timeslot call-direction lock.  This prevents a reflected or
+        # colliding opposite-direction call on the same talkgroup from stealing
+        # the slot while the current call is still active.  It is intentionally
+        # short-lived and active-call based, unlike the older broad reflection
+        # suppression window.
+        self._call_lock_owner = {1: None, 2: None}       # 'IPSC' or 'HBP'
+        self._call_lock_src   = {1: None, 2: None}       # 3-byte src_sub
+        self._call_lock_tg    = {1: None, 2: None}       # 3-byte dst_group
+        self._call_lock_until = {1: 0.0, 2: 0.0}         # post-call hang expiry
+        self._call_lock_blocked_ipsc = {1: {}, 2: {}}    # IPSC stream byte -> expiry
+        self._call_lock_blocked_hbp  = {1: {}, 2: {}}    # HBP stream bytes -> expiry
+
+        # HBP-to-IPSC pacing.  HBLink can deliver buffered DMRD frames in a burst,
+        # but MotoTRBO/IPSC expects approximately real-time 60 ms voice cadence.
+        self._ipsc_tx_queue = {1: deque(), 2: deque()}
+        self._ipsc_tx_handle = {1: None, 2: None}
+        self._in_started = {1: False, 2: False}  # True after an IPSC VHEAD has actually been sent
+
+        # Reflected-call suppression for IPSC PEER mode.  Disabled by default in
+        # this build because the original IPSC_Bridge did not suppress by
+        # src/tg/ts; it relied on slot-busy arbitration instead.
+        self._reflect_recent = {1: [], 2: []}     # [(src_sub, dst_group, expires_at), ...]
+        self._reflect_ignore = {1: {}, 2: {}}     # IPSC stream byte -> expires_at
 
         # Last-packet timestamps for hung-call detection (seconds since epoch)
         self._out_last_pkt  = {1: 0.0, 2: 0.0}
@@ -200,7 +238,16 @@ class CallTranslator:
         self._in_lc          = {1: None, 2: None}
         self._in_emb_lc      = {1: None, 2: None}
         self._in_stream_id   = {1: 0, 2: 0}
+        self._in_hbp_stream  = {1: None, 2: None}
+        self._in_src_sub     = {1: None, 2: None}
+        self._in_dst_group   = {1: None, 2: None}
+        self._in_last_head   = {1: 0.0, 2: 0.0}
         self._in_last_pkt    = {1: 0.0, 2: 0.0}
+        self._in_started     = {1: False, 2: False}
+        self._clear_ipsc_tx_queues()
+        self._reflect_recent = {1: [], 2: []}
+        self._reflect_ignore = {1: {}, 2: {}}
+        self._clear_call_locks()
         self._peer_call_type = b'\x02'
         self._peer_call_ctrl = b'\x00\x00\x43\xe2'
         if self._cfg.hbp_mode == 'TRACKING':
@@ -214,6 +261,15 @@ class CallTranslator:
         src_sub   = data[GV_SRC_SUB_OFF   : GV_SRC_SUB_OFF   + 3]
         dst_group = data[GV_DST_GROUP_OFF  : GV_DST_GROUP_OFF + 3]
         flags     = HBPF_TGID_TS2 if ts == 2 else 0x00
+        ipsc_stream = data[GV_IPSC_SEQ_OFF] if len(data) > GV_IPSC_SEQ_OFF else None
+
+        if self._call_lock_blocks(ts, 'IPSC', src_sub, dst_group, ipsc_stream, burst_type == VOICE_HEAD, burst_type == VOICE_TERM):
+            return
+
+        if self._should_suppress_ipsc_reflection(data, ts, burst_type, src_sub, dst_group):
+            return
+
+        self._ipsc_busy_last[ts] = time()
 
         # Learn call metadata so we echo the same values back inbound
         if len(data) >= 17:
@@ -318,6 +374,7 @@ class CallTranslator:
             self._out_stream_id[ts] = None
             self._out_lc[ts]        = None
             self._out_emb_lc[ts]    = None
+            self._release_call_lock(ts, 'IPSC', src_sub, dst_group)
 
     def _build_embed(self, pos: int, emb_lc) -> bitarray:
         """Build the 48-bit EMBED field for superframe position 0–5."""
@@ -343,10 +400,30 @@ class CallTranslator:
         self._in_lc         = {1: None, 2: None}
         self._in_emb_lc     = {1: None, 2: None}
         self._in_stream_id  = {1: 0, 2: 0}
+        self._in_hbp_stream = {1: None, 2: None}
+        self._in_src_sub    = {1: None, 2: None}
+        self._in_dst_group  = {1: None, 2: None}
+        self._in_last_head  = {1: 0.0, 2: 0.0}
         self._in_last_pkt   = {1: 0.0, 2: 0.0}
+        self._in_started    = {1: False, 2: False}
+        self._clear_ipsc_tx_queues()
+        self._reflect_recent = {1: [], 2: []}
+        self._reflect_ignore = {1: {}, 2: {}}
 
     def hbp_voice_received(self, dmrd: bytes):
-        """Inbound HBP → IPSC."""
+        """Inbound HBP -> IPSC.
+
+        This path now follows the older IPSC_Bridge/AMBE_IPSC behavior more
+        closely:
+
+        * a new HBP call allocates one IPSC stream byte for the whole call;
+        * IPSC RTP sequence starts at a random value per call;
+        * the RF side is not keyed on an isolated HBP VOICE_HEAD.  We wait for
+          the first voice frame, then send repeated IPSC VOICE_HEAD packets and
+          continue with voice at a paced cadence;
+        * broad reverse-direction suppression is avoided; slot-busy arbitration
+          decides whether HBP-originated traffic may transmit.
+        """
         if not self._ipsc.is_peer_registered():
             return
         if len(dmrd) < DMRD_LEN:
@@ -359,111 +436,461 @@ class CallTranslator:
         payload_33  = dmrd[DMRD_PAYLOAD_OFF : DMRD_PAYLOAD_OFF + 33]
 
         ts         = 2 if (flags & HBPF_TGID_TS2) else 1
-        self._in_last_pkt[ts] = time()
+        now        = time()
+        self._in_last_pkt[ts] = now
         frame_type = flags & HBPF_FRAMETYPE_MASK
         dtype      = flags & HBPF_DTYPE_MASK
         call_info  = TS_CALL_MSK if ts == 2 else 0x00
         slot_burst = SLOT2_VOICE if ts == 2 else SLOT1_VOICE
 
-        if frame_type == HBPF_FRAMETYPE_DATASYNC and dtype == HBPF_SLT_VHEAD:
-            # Decode actual LC from the BPTC-encoded DMRD VOICE_HEAD payload.
-            # encode_header_lc / decode_full_lc both operate on the 196-bit BPTC
-            # codeword, NOT the 264-bit full DMR frame.  The full frame has 10 slot-type
-            # bits at [98:108] and 48 sync bits at [108:156] inserted in the middle, so
-            # the BPTC second half lives at frame[166:264], not frame[98:196].
-            frame_bits = bitarray(endian='big')
-            frame_bits.frombytes(payload_33)
-            bptc_bits = frame_bits[0:98] + frame_bits[166:264]   # 196-bit BPTC only
-            lc = bptc.decode_full_lc(bptc_bits).tobytes()
-            self._in_lc[ts]     = lc
-            self._in_emb_lc[ts] = bptc.encode_emblc(lc)
-            # Assign a new stream ID for this call — byte 5 in GROUP_VOICE is a
-            # per-call constant (stream identifier), not a per-packet counter.
-            # Real Motorola equipment uses the same value for every packet of a call.
-            self._in_stream_ctr    = (self._in_stream_ctr + 1) & 0xFF
-            self._in_stream_id[ts] = self._in_stream_ctr
-            gv_payload = bytes([VOICE_HEAD]) + _build_ipsc_voice_payload(lc, VOICE_HEAD)
-            rtp_pt = 0xdd  # M=1 (call-start marker)
+        is_head = frame_type == HBPF_FRAMETYPE_DATASYNC and dtype == HBPF_SLT_VHEAD
+        is_term = frame_type == HBPF_FRAMETYPE_DATASYNC and dtype == HBPF_SLT_VTERM
+        # A voice burst without an active HBP call is a late-entry start.
+        is_hbp_start = is_head or (not is_term and self._in_lc[ts] is None)
 
-        elif frame_type == HBPF_FRAMETYPE_DATASYNC and dtype == HBPF_SLT_VTERM:
-            lc = self._in_lc[ts] if self._in_lc[ts] else LC_OPT + dst_group + src_sub
-            call_info |= END_MSK
-            gv_payload = bytes([VOICE_TERM]) + _build_ipsc_voice_payload(lc, VOICE_TERM)
-            rtp_pt = 0x5e
+        if self._call_lock_blocks(ts, 'HBP', src_sub, dst_group, hbp_stream, is_hbp_start, is_term):
+            return
 
-        else:  # VOICESYNC (burst A) or VOICE (bursts B-F)
-            if self._in_lc[ts] is None:
-                # Late entry: src_sub and dst_group are in every DMRD header so we
-                # can reconstruct a valid LC word immediately from any voice burst.
-                lc = LC_OPT + dst_group + src_sub
-                self._in_lc[ts]        = lc
-                self._in_emb_lc[ts]    = bptc.encode_emblc(lc)
-                self._in_stream_ctr    = (self._in_stream_ctr + 1) & 0xFF
-                self._in_stream_id[ts] = self._in_stream_ctr
-                log.info('HBP late entry: ts=%d src=%d tg=%d — LC from stream, hbp_stream=%s',
-                         ts, int.from_bytes(src_sub, 'big'), int.from_bytes(dst_group, 'big'),
-                         hbp_stream.hex())
-            ambe_19 = _extract_ambe_from_dmrd(payload_33)
+        if is_head:
+            lc = self._decode_hbp_voice_lc(payload_33)
+            same_hbp_stream = self._in_hbp_stream[ts] == hbp_stream
+            same_call_tuple = (
+                self._in_lc[ts] is not None
+                and self._in_src_sub[ts] == src_sub
+                and self._in_dst_group[ts] == dst_group
+            )
+            duplicate_head = bool(
+                self._in_lc[ts] is not None
+                and (same_hbp_stream or (same_call_tuple and (now - self._in_last_head[ts]) <= 1.5))
+            )
 
-            if frame_type == HBPF_FRAMETYPE_VOICESYNC:
-                # Burst A: 52 bytes total.  byte31=0x14 (len=20), byte32=0x40 (???)
-                gv_payload = bytes([slot_burst]) + b'\x14\x40' + ambe_19
+            if duplicate_head:
+                self._in_lc[ts] = lc
+                self._in_emb_lc[ts] = bptc.encode_emblc(lc)
+                self._in_last_head[ts] = now
+                log.debug('Duplicate HBP VOICE_HEAD ts=%d hbp_stream=%s src=%d tg=%d - keeping IPSC stream_id=0x%02x',
+                          ts, hbp_stream.hex(), int.from_bytes(src_sub, 'big'),
+                          int.from_bytes(dst_group, 'big'), self._in_stream_id[ts])
+                return
 
-            elif dtype == 4:
-                # Burst E (HBLink4 dtype=4): 66 bytes total.  byte31=0x22 (len=34), byte32=0x16
-                # bytes 52-55: embedded LC fragment 4 from encode_emblc
-                # bytes 56-58: LC[0:3]  (FLCO, FID, SVC_OPT)
-                # bytes 59-61: dst_group
-                # bytes 62-64: src_sub
-                # byte  65:    0x14 (constant)
-                emb_frag = (self._in_emb_lc[ts][4].tobytes()
-                            if self._in_emb_lc[ts] and 4 in self._in_emb_lc[ts]
-                            else _NULL_EMB_LC.tobytes())
-                lc_prefix = self._in_lc[ts][0:3] if self._in_lc[ts] else b'\x00\x00\x00'
-                gv_payload = (bytes([slot_burst]) + b'\x22\x16' + ambe_19
-                              + emb_frag + lc_prefix + dst_group + src_sub + b'\x14')
+            if self._in_hbp_stream[ts] is not None and self._in_lc[ts] is not None and self._in_started[ts]:
+                log.warning('HBP VOICE_HEAD interrupted active call: ts=%d old_stream=%s new_stream=%s',
+                            ts, self._in_hbp_stream[ts].hex(), hbp_stream.hex())
+                self._reset_hbp_to_ipsc_state(ts)
 
-            elif dtype >= 5:
-                # Burst F (HBLink4 dtype=5): null embedded LC, 57 bytes.
-                # byte  56:    0x10  (EMB header for BURST_F = 0x11, & 0xFE = 0x10)
-                gv_payload = bytes([slot_burst]) + b'\x19\x06' + ambe_19 + b'\x00\x00\x00\x00\x10'
+            self._in_lc[ts]         = lc
+            self._in_emb_lc[ts]     = bptc.encode_emblc(lc)
+            self._in_hbp_stream[ts] = hbp_stream
+            self._in_src_sub[ts]    = src_sub
+            self._in_dst_group[ts]  = dst_group
+            self._in_last_head[ts]  = now
+            self._in_started[ts]    = False
+            self._in_stream_ctr     = (self._in_stream_ctr + 1) & 0xFF
+            self._in_stream_id[ts]  = self._in_stream_ctr
+            self._in_rtp_seq[ts]    = randint(0, 0x7FFF)
+            self._in_rtp_ts[ts]     = randint(0, 0xFFFFFFFF)
 
-            else:
-                # Bursts B/C/D (HBLink4 dtype=1/2/3; dtype=0 handled as B for compatibility).
-                # 57 bytes total.  byte31=0x19 (len=25), byte32=0x06
-                # bytes 52-55: embedded LC fragment at encode_emblc position 1/2/3
-                # byte  56:    EMB header byte for this burst position, masked & 0xFE
-                pos      = max(dtype, 1)          # encode_emblc positions: 1=B, 2=C, 3=D
-                emb_frag = (self._in_emb_lc[ts][pos].tobytes()
-                            if self._in_emb_lc[ts] and pos in self._in_emb_lc[ts]
-                            else _NULL_EMB_LC.tobytes())
-                emb_hdr  = EMB[_EMB_BURST_NAMES[pos - 1]][:8].tobytes()[0] & 0xFE
-                gv_payload = (bytes([slot_burst]) + b'\x19\x06' + ambe_19
-                              + emb_frag + bytes([emb_hdr]))
-
-            rtp_pt = 0x5d
-
-        rtp_seq_b = struct.pack('>H', self._in_rtp_seq[ts] & 0xFFFF)
-        rtp_ts_b  = struct.pack('>I', self._in_rtp_ts[ts]  & 0xFFFFFFFF)
-        self._in_rtp_seq[ts] += 1
-        self._in_rtp_ts[ts]  += 480
-        rtp_hdr = b'\x80' + bytes([rtp_pt]) + rtp_seq_b + rtp_ts_b + b'\x00\x00\x00\x00'
-        self._ipsc.send_to_peer(
-            self._build_gv(src_sub, dst_group, call_info, rtp_hdr, gv_payload, self._in_stream_id[ts])
-        )
-
-        if frame_type == HBPF_FRAMETYPE_DATASYNC and dtype == HBPF_SLT_VHEAD:
             log.info('HBP call start: src=%d  tg=%d  ts=%d  stream=%s',
                      int.from_bytes(src_sub, 'big'), int.from_bytes(dst_group, 'big'), ts,
                      hbp_stream.hex())
-        elif frame_type == HBPF_FRAMETYPE_DATASYNC and dtype == HBPF_SLT_VTERM:
+
+            if not getattr(self._cfg, 'hbp_start_on_voice', True):
+                self._emit_hbp_ipsc_start(ts, src_sub, dst_group, call_info)
+            return
+
+        if is_term:
+            if not self._in_started[ts]:
+                if self._in_lc[ts] is not None:
+                    log.debug('Dropping HBP header-only call on ts=%d stream=%s; no voice before terminator',
+                              ts, hbp_stream.hex())
+                self._release_call_lock(ts, 'HBP', src_sub, dst_group)
+                self._reset_hbp_to_ipsc_state(ts)
+                return
+
+            lc = self._in_lc[ts] if self._in_lc[ts] else LC_OPT + dst_group + src_sub
+            call_info |= END_MSK
+            gv_payload = bytes([VOICE_TERM]) + _build_ipsc_voice_payload(lc, VOICE_TERM)
+            packet = self._make_hbp_ipsc_packet(ts, src_sub, dst_group, call_info, 0x5e, gv_payload)
+            self._send_hbp_to_ipsc(ts, packet, src_sub, dst_group, VOICE_TERM)
             log.info('HBP call end:   src=%d  tg=%d  ts=%d  stream=%s',
                      int.from_bytes(src_sub, 'big'), int.from_bytes(dst_group, 'big'), ts,
                      hbp_stream.hex())
-            self._in_lc[ts]     = None
-            self._in_emb_lc[ts] = None
+            self._release_call_lock(ts, 'HBP', src_sub, dst_group)
+            self._reset_hbp_to_ipsc_state(ts)
+            return
+
+        # VOICESYNC (burst A) or VOICE (bursts B-F)
+        if self._in_lc[ts] is None:
+            # Late entry: src_sub and dst_group are in every DMRD header so we
+            # can reconstruct a valid LC word immediately from any voice burst.
+            lc = LC_OPT + dst_group + src_sub
+            self._in_lc[ts]         = lc
+            self._in_emb_lc[ts]     = bptc.encode_emblc(lc)
+            self._in_hbp_stream[ts] = hbp_stream
+            self._in_src_sub[ts]    = src_sub
+            self._in_dst_group[ts]  = dst_group
+            self._in_last_head[ts]  = now
+            self._in_started[ts]    = False
+            self._in_stream_ctr     = (self._in_stream_ctr + 1) & 0xFF
+            self._in_stream_id[ts]  = self._in_stream_ctr
+            self._in_rtp_seq[ts]    = randint(0, 0x7FFF)
+            self._in_rtp_ts[ts]     = randint(0, 0xFFFFFFFF)
+            log.info('HBP late entry: ts=%d src=%d tg=%d - LC from stream, hbp_stream=%s',
+                     ts, int.from_bytes(src_sub, 'big'), int.from_bytes(dst_group, 'big'),
+                     hbp_stream.hex())
+
+        if not self._in_started[ts]:
+            self._emit_hbp_ipsc_start(ts, src_sub, dst_group, call_info)
+
+        ambe_19 = _extract_ambe_from_dmrd(payload_33)
+        if frame_type == HBPF_FRAMETYPE_VOICESYNC:
+            # Burst A: 52 bytes total.  byte31=0x14 (len=20), byte32=0x40.
+            gv_payload = bytes([slot_burst]) + b'\x14\x40' + ambe_19
+        elif dtype == 4:
+            # Burst E carries embedded LC fragment 4 and a copy of src/dst.
+            emb_frag = (self._in_emb_lc[ts][4].tobytes()
+                        if self._in_emb_lc[ts] and 4 in self._in_emb_lc[ts]
+                        else _NULL_EMB_LC.tobytes())
+            lc_prefix = self._in_lc[ts][0:3] if self._in_lc[ts] else b'\x00\x00\x00'
+            gv_payload = (bytes([slot_burst]) + b'\x22\x16' + ambe_19
+                          + emb_frag + lc_prefix + dst_group + src_sub + b'\x14')
+        elif dtype >= 5:
+            gv_payload = bytes([slot_burst]) + b'\x19\x06' + ambe_19 + b'\x00\x00\x00\x00\x10'
         else:
-            log.debug('← IPSC GV  burst=0x%02x  ts=%d  dtype=%d', slot_burst, ts, dtype)
+            pos      = max(dtype, 1)
+            emb_frag = (self._in_emb_lc[ts][pos].tobytes()
+                        if self._in_emb_lc[ts] and pos in self._in_emb_lc[ts]
+                        else _NULL_EMB_LC.tobytes())
+            emb_hdr  = EMB[_EMB_BURST_NAMES[pos - 1]][:8].tobytes()[0] & 0xFE
+            gv_payload = bytes([slot_burst]) + b'\x19\x06' + ambe_19 + emb_frag + bytes([emb_hdr])
+
+        packet = self._make_hbp_ipsc_packet(ts, src_sub, dst_group, call_info, 0x5d, gv_payload)
+        self._send_hbp_to_ipsc(ts, packet, src_sub, dst_group, slot_burst)
+        log.debug('<- IPSC GV  burst=0x%02x  ts=%d  dtype=%d', slot_burst, ts, dtype)
+
+    def _decode_hbp_voice_lc(self, payload_33: bytes) -> bytes:
+        """Decode the BPTC-encoded 9-byte LC from a HBP DMRD VOICE_HEAD frame."""
+        frame_bits = bitarray(endian='big')
+        frame_bits.frombytes(payload_33)
+        # The 196-bit BPTC codeword is split around slot type + sync in the
+        # 264-bit DMR frame: first half [0:98], second half [166:264].
+        bptc_bits = frame_bits[0:98] + frame_bits[166:264]
+        return bptc.decode_full_lc(bptc_bits).tobytes()
+
+    def _emit_hbp_ipsc_start(self, ts: int, src_sub: bytes, dst_group: bytes, call_info: int) -> None:
+        """Emit repeated IPSC VOICE_HEAD packets at actual voice start.
+
+        IPSC_Bridge/AMBE_IPSC sends three HEAD frames before voice.  We do the
+        same here, but only once voice has actually arrived unless configured
+        otherwise.  This prevents a lone early HBP header from keying RF and
+        then dropping before audio.
+        """
+        if self._in_started[ts]:
+            return
+        lc = self._in_lc[ts] if self._in_lc[ts] else LC_OPT + dst_group + src_sub
+        count = max(1, min(5, getattr(self._cfg, 'hbp_to_ipsc_header_repeats', 3)))
+        for idx in range(count):
+            rtp_pt = 0xdd if idx == 0 else 0x5d
+            gv_payload = bytes([VOICE_HEAD]) + _build_ipsc_voice_payload(lc, VOICE_HEAD)
+            packet = self._make_hbp_ipsc_packet(ts, src_sub, dst_group, call_info, rtp_pt, gv_payload)
+            self._send_hbp_to_ipsc(ts, packet, src_sub, dst_group, VOICE_HEAD)
+        self._in_started[ts] = True
+
+    def _make_hbp_ipsc_packet(
+        self,
+        ts: int,
+        src_sub: bytes,
+        dst_group: bytes,
+        call_info: int,
+        rtp_pt: int,
+        gv_payload: bytes,
+    ) -> bytes:
+        rtp_seq_b = struct.pack('>H', self._in_rtp_seq[ts] & 0xFFFF)
+        rtp_ts_b  = struct.pack('>I', self._in_rtp_ts[ts]  & 0xFFFFFFFF)
+        self._in_rtp_seq[ts] = (self._in_rtp_seq[ts] + 1) & 0xFFFF
+        self._in_rtp_ts[ts]  = (self._in_rtp_ts[ts] + 480) & 0xFFFFFFFF
+        rtp_hdr = b'\x80' + bytes([rtp_pt]) + rtp_seq_b + rtp_ts_b + b'\x00\x00\x00\x00'
+        return self._build_gv(src_sub, dst_group, call_info, rtp_hdr, gv_payload, self._in_stream_id[ts])
+
+    def _send_hbp_to_ipsc(self, ts: int, packet: bytes, src_sub: bytes, dst_group: bytes, burst_type: int) -> None:
+        """Send or queue a HBP-originated IPSC packet with optional real-time pacing."""
+        if not getattr(self._cfg, 'hbp_to_ipsc_pacing', True):
+            self._send_hbp_to_ipsc_now(ts, packet, src_sub, dst_group, burst_type)
+            return
+        queue_limit = max(10, getattr(self._cfg, 'hbp_to_ipsc_queue_limit', 512))
+        q = self._ipsc_tx_queue[ts]
+        if len(q) >= queue_limit:
+            log.warning('Dropping HBP->IPSC packet on ts=%d: pacing queue full (%d)', ts, queue_limit)
+            return
+        q.append((packet, src_sub, dst_group, burst_type))
+        if self._ipsc_tx_handle[ts] is None:
+            self._drain_hbp_to_ipsc_queue(ts)
+
+    def _drain_hbp_to_ipsc_queue(self, ts: int) -> None:
+        self._ipsc_tx_handle[ts] = None
+        q = self._ipsc_tx_queue[ts]
+        if not q:
+            return
+        packet, src_sub, dst_group, burst_type = q.popleft()
+        self._send_hbp_to_ipsc_now(ts, packet, src_sub, dst_group, burst_type)
+        if q:
+            loop = asyncio.get_event_loop()
+            delay = max(0.010, getattr(self._cfg, 'hbp_to_ipsc_frame_interval_ms', 60) / 1000.0)
+            self._ipsc_tx_handle[ts] = loop.call_later(delay, self._drain_hbp_to_ipsc_queue, ts)
+        else:
+            self._hbp_ipsc_queue_drained(ts)
+
+    def _send_hbp_to_ipsc_now(self, ts: int, packet: bytes, src_sub: bytes, dst_group: bytes, burst_type: int) -> None:
+        if self._is_ipsc_slot_busy(ts):
+            log.info('Slot %d is busy from IPSC; dropping HBP->IPSC packet src=%d tg=%d burst=0x%02x',
+                     ts, int.from_bytes(src_sub, 'big'), int.from_bytes(dst_group, 'big'), burst_type)
+            return
+        self._ipsc.send_to_peer(packet)
+        self._remember_hbp_to_ipsc(ts, src_sub, dst_group)
+
+    def _is_ipsc_slot_busy(self, ts: int) -> bool:
+        if not getattr(self._cfg, 'ipsc_busy_slot_guard', True):
+            return False
+        holdoff = max(0, getattr(self._cfg, 'ipsc_busy_holdoff_ms', 100)) / 1000.0
+        if holdoff <= 0:
+            return False
+        return (time() - self._ipsc_busy_last[ts]) < holdoff
+
+    def _clear_ipsc_tx_queues(self) -> None:
+        for ts in (1, 2):
+            handle = self._ipsc_tx_handle.get(ts)
+            if handle is not None:
+                handle.cancel()
+                self._ipsc_tx_handle[ts] = None
+            self._ipsc_tx_queue[ts].clear()
+
+    def _reset_hbp_to_ipsc_state(self, ts: int) -> None:
+        self._in_lc[ts] = None
+        self._in_emb_lc[ts] = None
+        self._in_hbp_stream[ts] = None
+        self._in_src_sub[ts] = None
+        self._in_dst_group[ts] = None
+        self._in_last_head[ts] = 0.0
+        self._in_started[ts] = False
+
+    def _remember_hbp_to_ipsc(self, ts: int, src_sub: bytes, dst_group: bytes) -> None:
+        """Remember HBP-originated traffic so PEER mode can suppress master echoes."""
+        if not getattr(self._cfg, 'ipsc_reflect_suppression', False):
+            return
+        window = max(0, getattr(self._cfg, 'ipsc_reflect_window', 8))
+        if window <= 0:
+            return
+        now = time()
+        expires = now + window
+        entries = [e for e in self._reflect_recent[ts] if e[2] > now]
+        # Collapse repeated packets from the same call into one expiry entry.
+        updated = False
+        for idx, (src, dst, _old_expires) in enumerate(entries):
+            if src == src_sub and dst == dst_group:
+                entries[idx] = (src_sub, dst_group, expires)
+                updated = True
+                break
+        if not updated:
+            entries.append((src_sub, dst_group, expires))
+        self._reflect_recent[ts] = entries
+
+    def _call_lock_blocks(
+        self,
+        ts: int,
+        direction: str,
+        src_sub: bytes,
+        dst_group: bytes,
+        stream_key,
+        is_start: bool,
+        is_end: bool,
+    ) -> bool:
+        """Return True when a packet should be dropped by call-direction lock.
+
+        The lock is per timeslot.  When a call is active in one direction, a
+        same-talkgroup call in the opposite direction is treated as a reflection
+        or collision and is ignored until the active call ends.  This is more
+        precise than suppressing every later packet with the same src/tg/ts.
+        """
+        if not getattr(self._cfg, 'ipsc_call_lock', True):
+            return False
+
+        now = time()
+        self._prune_call_lock_blocks(ts, now)
+
+        block_for = max(10.0, getattr(self._cfg, 'ipsc_call_lock_hang_ms', 250) / 1000.0 + 2.0)
+
+        # If a stream was already rejected because it collided with the current
+        # owner, keep dropping that stream through its terminator even if the
+        # owner clears while the rejected stream is still arriving.
+        if direction == 'IPSC' and stream_key is not None:
+            blocked = self._call_lock_blocked_ipsc[ts]
+            if stream_key in blocked:
+                if is_end:
+                    blocked.pop(stream_key, None)
+                else:
+                    blocked[stream_key] = now + block_for
+                return True
+        elif direction == 'HBP' and stream_key is not None:
+            blocked = self._call_lock_blocked_hbp[ts]
+            if stream_key in blocked:
+                if is_end:
+                    blocked.pop(stream_key, None)
+                else:
+                    blocked[stream_key] = now + block_for
+                return True
+
+        owner = self._call_lock_owner[ts]
+        if owner is not None and not self._call_lock_is_active(ts, now):
+            self._clear_call_lock(ts)
+            owner = None
+
+        if owner is None:
+            # First packet on this slot establishes the current owner.  For HBP,
+            # this is usually VOICE_HEAD; for late-entry it can be the first
+            # voice burst.  For IPSC, this is normally VOICE_HEAD.
+            self._acquire_call_lock(ts, direction, src_sub, dst_group, now)
+            return False
+
+        if owner == direction:
+            # Same direction continues the current call.  Keep the original TG
+            # for matching unless this is a fresh start after the previous owner
+            # has already been cleared.
+            return False
+
+        same_tg_only = getattr(self._cfg, 'ipsc_call_lock_same_tg_only', True)
+        owner_tg = self._call_lock_tg[ts]
+        same_tg = (owner_tg == dst_group)
+        if same_tg_only and not same_tg:
+            return False
+
+        # Opposite direction while the owner is active: block it.  If this is a
+        # call start, remember its stream so the rest of that rejected call does
+        # not leak through after the owner releases.
+        expires = now + block_for
+        if direction == 'IPSC' and stream_key is not None:
+            self._call_lock_blocked_ipsc[ts][stream_key] = expires
+        elif direction == 'HBP' and stream_key is not None:
+            self._call_lock_blocked_hbp[ts][stream_key] = expires
+
+        log.info(
+            'Call lock holding %s call on ts=%d tg=%d; dropping inverse %s packet src=%d tg=%d%s',
+            owner,
+            ts,
+            int.from_bytes(owner_tg or b'\x00\x00\x00', 'big'),
+            direction,
+            int.from_bytes(src_sub, 'big'),
+            int.from_bytes(dst_group, 'big'),
+            ' start' if is_start else '',
+        )
+        return True
+
+    def _acquire_call_lock(self, ts: int, direction: str, src_sub: bytes, dst_group: bytes, now: float) -> None:
+        if not getattr(self._cfg, 'ipsc_call_lock', True):
+            return
+        self._call_lock_owner[ts] = direction
+        self._call_lock_src[ts] = src_sub
+        self._call_lock_tg[ts] = dst_group
+        self._call_lock_until[ts] = 0.0
+        log.debug('Call lock acquired: owner=%s ts=%d src=%d tg=%d',
+                  direction, ts, int.from_bytes(src_sub, 'big'), int.from_bytes(dst_group, 'big'))
+
+    def _release_call_lock(self, ts: int, direction: str, src_sub: bytes | None = None, dst_group: bytes | None = None) -> None:
+        if not getattr(self._cfg, 'ipsc_call_lock', True):
+            return
+        if self._call_lock_owner[ts] != direction:
+            return
+        hang = max(0, getattr(self._cfg, 'ipsc_call_lock_hang_ms', 250)) / 1000.0
+        self._call_lock_until[ts] = time() + hang
+        log.debug('Call lock released by %s: ts=%d hang_ms=%d', direction, ts, int(hang * 1000))
+
+    def _call_lock_is_active(self, ts: int, now: float | None = None) -> bool:
+        if now is None:
+            now = time()
+        owner = self._call_lock_owner[ts]
+        if owner is None:
+            return False
+        if owner == 'IPSC' and self._out_stream_id[ts] is not None:
+            return True
+        if owner == 'HBP' and (self._in_lc[ts] is not None or self._in_started[ts] or bool(self._ipsc_tx_queue[ts])):
+            return True
+        return now <= self._call_lock_until[ts]
+
+    def _clear_call_lock(self, ts: int) -> None:
+        self._call_lock_owner[ts] = None
+        self._call_lock_src[ts] = None
+        self._call_lock_tg[ts] = None
+        self._call_lock_until[ts] = 0.0
+
+    def _clear_call_locks(self) -> None:
+        for ts in (1, 2):
+            self._clear_call_lock(ts)
+            self._call_lock_blocked_ipsc[ts].clear()
+            self._call_lock_blocked_hbp[ts].clear()
+
+    def _prune_call_lock_blocks(self, ts: int, now: float) -> None:
+        self._call_lock_blocked_ipsc[ts] = {
+            sid: exp for sid, exp in self._call_lock_blocked_ipsc[ts].items() if exp > now
+        }
+        self._call_lock_blocked_hbp[ts] = {
+            sid: exp for sid, exp in self._call_lock_blocked_hbp[ts].items() if exp > now
+        }
+
+    def _hbp_ipsc_queue_drained(self, ts: int) -> None:
+        if self._call_lock_owner[ts] == 'HBP' and self._in_lc[ts] is None:
+            hang = max(0, getattr(self._cfg, 'ipsc_call_lock_hang_ms', 250)) / 1000.0
+            self._call_lock_until[ts] = time() + hang
+
+    def _should_suppress_ipsc_reflection(
+        self,
+        data: bytes,
+        ts: int,
+        burst_type: int,
+        src_sub: bytes,
+        dst_group: bytes,
+    ) -> bool:
+        """Drop IPSC calls that are the upstream echo of our own HBP-originated call."""
+        if not getattr(self._cfg, 'ipsc_reflect_suppression', False):
+            return False
+        if getattr(self._cfg, 'ipsc_mode', 'MASTER') != 'PEER':
+            return False
+        if len(data) <= GV_IPSC_SEQ_OFF:
+            return False
+
+        now = time()
+        # Prune expired recent signatures.
+        self._reflect_recent[ts] = [e for e in self._reflect_recent[ts] if e[2] > now]
+
+        ipsc_stream = data[GV_IPSC_SEQ_OFF]
+        window = max(1, getattr(self._cfg, 'ipsc_reflect_window', 8))
+        self._reflect_ignore[ts] = {sid: exp for sid, exp in self._reflect_ignore[ts].items() if exp > now}
+
+        if ipsc_stream in self._reflect_ignore[ts]:
+            if burst_type == VOICE_TERM:
+                self._reflect_ignore[ts].pop(ipsc_stream, None)
+                log.info('Suppressed reflected IPSC call end: src=%d tg=%d ts=%d stream_id=0x%02x',
+                         int.from_bytes(src_sub, 'big'), int.from_bytes(dst_group, 'big'), ts, ipsc_stream)
+            else:
+                self._reflect_ignore[ts][ipsc_stream] = now + window
+            return True
+
+        if burst_type != VOICE_HEAD:
+            return False
+
+        # Only suppress while the HBP-originated call is still active.  After it
+        # ends, a new IPSC VOICE_HEAD with the same src/tg/ts is a legitimate
+        # reverse-direction call and must be allowed.  This is closer to the
+        # original IPSC_Bridge behavior, which used slot-busy arbitration rather
+        # than long src/tg suppression windows.
+        if not self._in_started[ts]:
+            return False
+
+        for seen_src, seen_dst, _expires in self._reflect_recent[ts]:
+            if seen_src == src_sub and seen_dst == dst_group:
+                self._reflect_ignore[ts][ipsc_stream] = now + window
+                log.info('Suppressing reflected IPSC call from upstream: src=%d tg=%d ts=%d stream_id=0x%02x',
+                         int.from_bytes(src_sub, 'big'), int.from_bytes(dst_group, 'big'), ts, ipsc_stream)
+                return True
+        return False
 
     def _build_gv(self, src_sub, dst_group, call_info, rtp_hdr, gv_payload, stream_id: int) -> bytes:
         """Assemble a complete GROUP_VOICE packet."""
@@ -504,6 +931,7 @@ class CallTranslator:
                     self._out_stream_id[ts] = None
                     self._out_lc[ts]        = None
                     self._out_emb_lc[ts]    = None
+                    self._release_call_lock(ts, 'IPSC')
             if self._in_lc[ts] is not None:
                 elapsed = now - self._in_last_pkt[ts]
                 if elapsed > timeout:
@@ -511,8 +939,8 @@ class CallTranslator:
                         'HBP→IPSC call timeout: ts=%d — no voice for %.1fs, clearing',
                         ts, elapsed,
                     )
-                    self._in_lc[ts]     = None
-                    self._in_emb_lc[ts] = None
+                    self._release_call_lock(ts, 'HBP')
+                    self._reset_hbp_to_ipsc_state(ts)
 
     # ------------------------------------------------------------------
     # Status queries

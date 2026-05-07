@@ -1,3 +1,9 @@
+# PEER-mode turnkey build
+
+This copy includes a new `MODE=PEER` / `[ipsc].mode = "PEER"` IPSC client mode while preserving the original local IPSC master behavior as `[ipsc].mode = "MASTER"`. The included default `ipsc2hbp.toml` follows the Arapahoe-style config layout with `[ipsc_upstream] master_ip` and `master_port`. See `TURNKEY_README.md` and `PEER_MODE.md` for the PEER-specific runtime notes.
+
+---
+
 ## PROJECT: IPSC to HomeBrew Protocol Translator ##
 
 **NOTICE:** This software only supports Group Voice traffic at this time. IPSC is not an open standard. Supporting it invovles painstaking reverse engineering of IPSC packets, and much is unknown. IPSC is owned by and heavily protected by Motorola Solutions, Inc. Please do not ask for features that require further deciphering of IPSC without providing verified correct, legally obtained information about the protocol necessary to support a feature.
