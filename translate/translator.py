@@ -157,6 +157,7 @@ class CallTranslator:
         self._repeater_id_b = cfg.hbp_repeater_id.to_bytes(4, 'big')
         ipsc_source_id     = getattr(cfg, 'ipsc_source_id', cfg.ipsc_master_id)
         self._master_id_b   = ipsc_source_id.to_bytes(4, 'big')
+        self._legacy_flow   = getattr(cfg, 'compat_packet_flow', 'PACKET_TRANSLATOR') == 'LEGACY_AMBE'
 
         # Outbound call state (IPSC → HBP) — keyed by timeslot (1 or 2)
         self._out_stream_id = {1: None, 2: None}  # 4 random bytes, new per call
@@ -164,6 +165,7 @@ class CallTranslator:
         self._out_frame_pos = {1: 0, 2: 0}        # superframe position (0–5, cycles)
         self._out_lc        = {1: None, 2: None}  # 9-byte LC for embedded LC generation
         self._out_emb_lc    = {1: None, 2: None}  # dict {1–4: bitarray(32)} embedded LC
+        self._out_ipsc_stream_byte = {1: None, 2: None}  # IPSC byte-5 stream id currently accepted per TS
 
         # Inbound call state (HBP → IPSC) — keyed by timeslot (1 or 2)
         self._in_lc         = {1: None, 2: None}  # 9-byte LC decoded from HBP VOICE_HEAD
@@ -199,6 +201,12 @@ class CallTranslator:
         # but MotoTRBO/IPSC expects approximately real-time 60 ms voice cadence.
         self._ipsc_tx_queue = {1: deque(), 2: deque()}
         self._ipsc_tx_handle = {1: None, 2: None}
+        # Absolute monotonic wall-clock time when the next HBP-originated IPSC
+        # packet may leave this process.  This is intentionally separate from
+        # queue emptiness.  The older bridge slept between header/voice packets;
+        # the previous queue-only implementation let generated bursts escape in
+        # the same event-loop tick when the queue briefly became empty.
+        self._ipsc_tx_next_at = {1: 0.0, 2: 0.0}
         self._in_started = {1: False, 2: False}  # True after an IPSC VHEAD has actually been sent
 
         # Reflected-call suppression for IPSC PEER mode.  Disabled by default in
@@ -234,6 +242,7 @@ class CallTranslator:
         self._out_stream_id  = {1: None, 2: None}
         self._out_lc         = {1: None, 2: None}
         self._out_emb_lc     = {1: None, 2: None}
+        self._out_ipsc_stream_byte = {1: None, 2: None}
         self._out_last_pkt   = {1: 0.0, 2: 0.0}
         self._in_lc          = {1: None, 2: None}
         self._in_emb_lc      = {1: None, 2: None}
@@ -263,6 +272,9 @@ class CallTranslator:
         flags     = HBPF_TGID_TS2 if ts == 2 else 0x00
         ipsc_stream = data[GV_IPSC_SEQ_OFF] if len(data) > GV_IPSC_SEQ_OFF else None
 
+        if self._legacy_ipsc_stream_drop(ts, ipsc_stream, burst_type, src_sub, dst_group):
+            return
+
         if self._call_lock_blocks(ts, 'IPSC', src_sub, dst_group, ipsc_stream, burst_type == VOICE_HEAD, burst_type == VOICE_TERM):
             return
 
@@ -283,10 +295,14 @@ class CallTranslator:
                          int.from_bytes(src_sub, 'big'), int.from_bytes(dst_group, 'big'),
                          ts, self._out_stream_id[ts].hex())
             else:
-                # Motorola radios fire VOICE_HEAD twice at call start — once on LC
-                # detection, once confirmed. MMDVMHost absorbs this at the driver
-                # layer; we see it raw over IPSC. Reuse the existing stream_id so
-                # HBlink doesn't flag stream contention.
+                # Motorola radios fire VOICE_HEAD more than once at call start.
+                # In legacy AMBE mode we treat later heads as metadata repeats,
+                # not new HBP headers.  The old IPSC_Bridge only called
+                # begin_call when the IPSC stream byte changed.
+                if self._legacy_flow:
+                    log.debug('Legacy flow: ignoring duplicate IPSC VOICE_HEAD ts=%d stream=%s',
+                              ts, self._out_stream_id[ts].hex())
+                    return
                 log.debug('Duplicate VOICE_HEAD ts=%d — keeping stream=%s',
                           ts, self._out_stream_id[ts].hex())
             self._out_frame_pos[ts] = 0
@@ -321,6 +337,14 @@ class CallTranslator:
 
         else:  # SLOT1_VOICE or SLOT2_VOICE
             if self._out_stream_id[ts] is None:
+                # Legacy IPSC_Bridge did not synthesize late-entry calls from raw
+                # voice; it waited for a valid begin/head.  Do the same in
+                # LEGACY_AMBE mode so delayed/out-of-order voice does not create
+                # a phantom call.
+                if self._legacy_flow:
+                    log.debug('Legacy flow: dropping IPSC voice without active VOICE_HEAD ts=%d stream=%s',
+                              ts, 'none' if ipsc_stream is None else f'0x{ipsc_stream:02x}')
+                    return
                 # Late entry: IPSC Burst E (byte 32 == 0x16) carries dst_group and
                 # src_sub in the header, giving us enough to reconstruct the LC word
                 # and resume forwarding mid-stream. All other burst types lack
@@ -353,20 +377,27 @@ class CallTranslator:
             flags |= HBPF_FRAMETYPE_VOICESYNC if pos == 0 else (HBPF_FRAMETYPE_VOICE | pos)
             self._out_frame_pos[ts] += 1
 
-        dmrd = (
-            HBPF_DMRD
-            + bytes([self._out_seq])
-            + src_sub
-            + dst_group
-            + self._repeater_id_b
-            + bytes([flags])
-            + self._out_stream_id[ts]
-            + payload_33
-            + b'\x00\x00'   # BER + RSSI (synthesised, no RF measurement)
-        )
-        self._out_seq = (self._out_seq + 1) & 0xFF
-        self._hbp.send_dmrd(dmrd)
-        log.debug('→ HBP DMRD  burst=0x%02x  ts=%d  flags=0x%02x', burst_type, ts, flags)
+        # The legacy HB side sent two voice headers on call start.  Sending
+        # exactly one can be too fragile for some HBP/MMDVM receivers, while
+        # replaying every duplicate IPSC head is worse.  In LEGACY_AMBE mode we
+        # send a controlled two-header start and ignore subsequent duplicate
+        # IPSC VOICE_HEAD packets above.
+        repeat_count = 2 if (self._legacy_flow and burst_type == VOICE_HEAD) else 1
+        for _ in range(repeat_count):
+            dmrd = (
+                HBPF_DMRD
+                + bytes([self._out_seq])
+                + src_sub
+                + dst_group
+                + self._repeater_id_b
+                + bytes([flags])
+                + self._out_stream_id[ts]
+                + payload_33
+                + b'\x00\x00'   # BER + RSSI (synthesised, no RF measurement)
+            )
+            self._out_seq = (self._out_seq + 1) & 0xFF
+            self._hbp.send_dmrd(dmrd)
+        log.debug('→ HBP DMRD  burst=0x%02x  ts=%d  flags=0x%02x repeat=%d', burst_type, ts, flags, repeat_count)
 
         if burst_type == VOICE_TERM:
             log.info('IPSC call end:   src=%d  tg=%d  ts=%d',
@@ -374,7 +405,83 @@ class CallTranslator:
             self._out_stream_id[ts] = None
             self._out_lc[ts]        = None
             self._out_emb_lc[ts]    = None
+            self._out_ipsc_stream_byte[ts] = None
             self._release_call_lock(ts, 'IPSC', src_sub, dst_group)
+
+    def _legacy_ipsc_stream_drop(self, ts: int, ipsc_stream, burst_type: int, src_sub: bytes, dst_group: bytes) -> bool:
+        """Old IPSC_Bridge-like stream handling for IPSC -> HBP.
+
+        The original IPSC_Bridge did not treat every stream-byte mismatch as a
+        reason to drop AMBE.  It used VOICE_HEAD as metadata/begin-call and then
+        exported voice bursts.  On a high-latency link, strict stream rejection
+        can turn harmless late/out-of-order packets into audio holes.
+
+        Behavior here:
+        * a new VOICE_HEAD with a new stream resets the local call metadata and
+          is allowed through;
+        * voice for a different stream is accepted while a call is active;
+        * voice before any header is still dropped because there is no metadata.
+        """
+        if not self._legacy_flow or ipsc_stream is None:
+            return False
+
+        current = self._out_ipsc_stream_byte[ts]
+        active = self._out_stream_id[ts] is not None
+
+        if burst_type == VOICE_HEAD:
+            if current is not None and active and current != ipsc_stream:
+                log.info(
+                    'Legacy loose flow: IPSC VOICE_HEAD changed stream on active ts=%d current=0x%02x new=0x%02x src=%d tg=%d; resetting metadata',
+                    ts, current, ipsc_stream, int.from_bytes(src_sub, 'big'), int.from_bytes(dst_group, 'big'),
+                )
+                self._out_stream_id[ts] = None
+                self._out_lc[ts] = None
+                self._out_emb_lc[ts] = None
+                self._release_call_lock(ts, 'IPSC', src_sub, dst_group)
+            self._out_ipsc_stream_byte[ts] = ipsc_stream
+            return False
+
+        if current is None and not active:
+            log.debug('Legacy loose flow: dropping IPSC packet without call metadata ts=%d stream=0x%02x burst=0x%02x',
+                      ts, ipsc_stream, burst_type)
+            return True
+
+        if current is not None and current != ipsc_stream:
+            log.debug('Legacy loose flow: accepting IPSC voice from changed stream ts=%d current=0x%02x got=0x%02x burst=0x%02x',
+                      ts, current, ipsc_stream, burst_type)
+        return False
+
+    def _legacy_hbp_stream_drop(self, ts: int, hbp_stream: bytes, is_head: bool, is_term: bool, src_sub: bytes, dst_group: bytes) -> bool:
+        """Old AMBE-style stream handling for HBP -> IPSC.
+
+        Do not use strict HBP stream rejection on marginal links.  Accept voice
+        from a changed stream while a call is active so late/clumped HBP packets
+        do not create audio holes.  A new VOICE_HEAD is allowed through and the
+        caller in hbp_voice_received() will reset the call metadata.  Only a
+        terminator from a foreign stream is ignored so it cannot kill the active
+        call.
+        """
+        if not self._legacy_flow:
+            return False
+        current = self._in_hbp_stream[ts]
+        active = self._in_lc[ts] is not None or self._in_started[ts] or bool(self._ipsc_tx_queue[ts])
+        if current is None or not active or current == hbp_stream:
+            return False
+
+        if is_head:
+            log.info(
+                'Legacy loose flow: accepting HBP VOICE_HEAD stream change on active ts=%d current=%s new=%s src=%d tg=%d; caller will reset metadata',
+                ts, current.hex(), hbp_stream.hex(), int.from_bytes(src_sub, 'big'), int.from_bytes(dst_group, 'big'),
+            )
+            return False
+        if is_term:
+            log.debug('Legacy loose flow: ignoring HBP terminator from stale stream ts=%d current=%s got=%s',
+                      ts, current.hex(), hbp_stream.hex())
+            return True
+
+        log.debug('Legacy loose flow: accepting HBP voice from changed stream ts=%d current=%s got=%s',
+                  ts, current.hex(), hbp_stream.hex())
+        return False
 
     def _build_embed(self, pos: int, emb_lc) -> bitarray:
         """Build the 48-bit EMBED field for superframe position 0–5."""
@@ -396,6 +503,7 @@ class CallTranslator:
         self._out_stream_id = {1: None, 2: None}
         self._out_lc        = {1: None, 2: None}
         self._out_emb_lc    = {1: None, 2: None}
+        self._out_ipsc_stream_byte = {1: None, 2: None}
         self._out_last_pkt  = {1: 0.0, 2: 0.0}
         self._in_lc         = {1: None, 2: None}
         self._in_emb_lc     = {1: None, 2: None}
@@ -449,6 +557,9 @@ class CallTranslator:
         is_hbp_start = is_head or (not is_term and self._in_lc[ts] is None)
 
         if self._call_lock_blocks(ts, 'HBP', src_sub, dst_group, hbp_stream, is_hbp_start, is_term):
+            return
+
+        if self._legacy_hbp_stream_drop(ts, hbp_stream, is_head, is_term, src_sub, dst_group):
             return
 
         if is_head:
@@ -521,6 +632,10 @@ class CallTranslator:
 
         # VOICESYNC (burst A) or VOICE (bursts B-F)
         if self._in_lc[ts] is None:
+            if self._legacy_flow:
+                log.debug('Legacy flow: dropping HBP voice without active VOICE_HEAD ts=%d stream=%s',
+                          ts, hbp_stream.hex())
+                return
             # Late entry: src_sub and dst_group are in every DMRD header so we
             # can reconstruct a valid LC word immediately from any voice burst.
             lc = LC_OPT + dst_group + src_sub
@@ -613,7 +728,14 @@ class CallTranslator:
         return self._build_gv(src_sub, dst_group, call_info, rtp_hdr, gv_payload, self._in_stream_id[ts])
 
     def _send_hbp_to_ipsc(self, ts: int, packet: bytes, src_sub: bytes, dst_group: bytes, burst_type: int) -> None:
-        """Send or queue a HBP-originated IPSC packet with optional real-time pacing."""
+        """Send or queue a HBP-originated IPSC packet with optional real-time pacing.
+
+        Pacing is a cooldown, not just a queue drain.  This matters because a
+        single HBP callback can generate several IPSC packets at once: repeated
+        VOICE_HEAD frames followed immediately by the first voice burst.  Without
+        a persistent next-send timestamp, each enqueue can drain immediately and
+        the repeater sees a packet burst instead of a 60 ms cadence.
+        """
         if not getattr(self._cfg, 'hbp_to_ipsc_pacing', True):
             self._send_hbp_to_ipsc_now(ts, packet, src_sub, dst_group, burst_type)
             return
@@ -624,19 +746,38 @@ class CallTranslator:
             return
         q.append((packet, src_sub, dst_group, burst_type))
         if self._ipsc_tx_handle[ts] is None:
-            self._drain_hbp_to_ipsc_queue(ts)
+            self._schedule_hbp_to_ipsc_drain(ts)
+
+    def _schedule_hbp_to_ipsc_drain(self, ts: int) -> None:
+        """Schedule the next paced HBP->IPSC transmit for a timeslot."""
+        if self._ipsc_tx_handle[ts] is not None:
+            return
+        if not self._ipsc_tx_queue[ts]:
+            self._hbp_ipsc_queue_drained(ts)
+            return
+        now = time()
+        delay = max(0.0, self._ipsc_tx_next_at[ts] - now)
+        loop = asyncio.get_event_loop()
+        if delay <= 0.001:
+            self._ipsc_tx_handle[ts] = loop.call_soon(self._drain_hbp_to_ipsc_queue, ts)
+        else:
+            self._ipsc_tx_handle[ts] = loop.call_later(delay, self._drain_hbp_to_ipsc_queue, ts)
 
     def _drain_hbp_to_ipsc_queue(self, ts: int) -> None:
         self._ipsc_tx_handle[ts] = None
         q = self._ipsc_tx_queue[ts]
         if not q:
+            self._hbp_ipsc_queue_drained(ts)
             return
         packet, src_sub, dst_group, burst_type = q.popleft()
         self._send_hbp_to_ipsc_now(ts, packet, src_sub, dst_group, burst_type)
+
+        interval = max(0.010, getattr(self._cfg, 'hbp_to_ipsc_frame_interval_ms', 60) / 1000.0)
+        # Use current time after send so logging/socket work is included in the
+        # interval.  That avoids back-to-back packets after a brief event-loop lag.
+        self._ipsc_tx_next_at[ts] = time() + interval
         if q:
-            loop = asyncio.get_event_loop()
-            delay = max(0.010, getattr(self._cfg, 'hbp_to_ipsc_frame_interval_ms', 60) / 1000.0)
-            self._ipsc_tx_handle[ts] = loop.call_later(delay, self._drain_hbp_to_ipsc_queue, ts)
+            self._schedule_hbp_to_ipsc_drain(ts)
         else:
             self._hbp_ipsc_queue_drained(ts)
 
@@ -663,6 +804,7 @@ class CallTranslator:
                 handle.cancel()
                 self._ipsc_tx_handle[ts] = None
             self._ipsc_tx_queue[ts].clear()
+            self._ipsc_tx_next_at[ts] = 0.0
 
     def _reset_hbp_to_ipsc_state(self, ts: int) -> None:
         self._in_lc[ts] = None
@@ -717,7 +859,7 @@ class CallTranslator:
         now = time()
         self._prune_call_lock_blocks(ts, now)
 
-        block_for = max(10.0, getattr(self._cfg, 'ipsc_call_lock_hang_ms', 250) / 1000.0 + 2.0)
+        block_for = max(0.5, getattr(self._cfg, 'ipsc_call_lock_hang_ms', 250) / 1000.0 + 1.0)
 
         # If a stream was already rejected because it collided with the current
         # owner, keep dropping that stream through its terminator even if the

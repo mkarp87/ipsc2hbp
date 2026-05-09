@@ -18,6 +18,7 @@ log = logging.getLogger(__name__)
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 _VALID_HBP_MODES = {"TRACKING", "PERSISTENT"}
 _VALID_IPSC_MODES = {"MASTER", "PEER"}
+_VALID_PACKET_FLOWS = {"PACKET_TRANSLATOR", "LEGACY_AMBE"}
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,9 @@ class Config:
     ipsc_call_lock: bool
     ipsc_call_lock_hang_ms: int
     ipsc_call_lock_same_tg_only: bool
+
+    # [compat]
+    compat_packet_flow: str
 
     # [hbp]
     hbp_master_ip: str
@@ -116,6 +120,7 @@ def load(path: str | Path) -> Config:
     global_s = required_section("global")
     ipsc_s = required_section("ipsc")
     ipsc_upstream_s = optional_section("ipsc_upstream")
+    compat_s = optional_section("compat")
     hbp_s = required_section("hbp")
 
     def get_str(
@@ -382,6 +387,16 @@ def load(path: str | Path) -> Config:
         default=True,
     )
 
+    # [compat]
+    compat_packet_flow = get_str(
+        compat_s,
+        "compat",
+        "packet_flow",
+        required=False,
+        default="PACKET_TRANSLATOR",
+        choices=_VALID_PACKET_FLOWS,
+    )
+
     # [hbp]
     hbp_master_ip = get_str(hbp_s, "hbp", "master_ip")
     hbp_master_port = get_int(hbp_s, "hbp", "master_port", min_val=1, max_val=65535)
@@ -486,6 +501,7 @@ def load(path: str | Path) -> Config:
         ipsc_call_lock=ipsc_call_lock,
         ipsc_call_lock_hang_ms=ipsc_call_lock_hang_ms,
         ipsc_call_lock_same_tg_only=ipsc_call_lock_same_tg_only,
+        compat_packet_flow=compat_packet_flow,
         hbp_master_ip=hbp_master_ip,
         hbp_master_port=hbp_master_port,
         hbp_repeater_id=resolved_repeater_id,

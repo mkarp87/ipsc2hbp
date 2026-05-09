@@ -115,26 +115,3 @@ description = "Arapahoe, NC"
 url         = ""
 software_id = "ipsc2hbp"
 package_id  = "duplex"
-
-
-# High-latency / wireless backhaul profile:
-#
-# [compat]
-# packet_flow = "LEGACY_AMBE"
-#
-# [ipsc]
-# reflect_suppression = false
-# reflect_window = 0
-# busy_slot_guard = false
-# busy_holdoff_ms = 0
-# call_lock = true
-# call_lock_hang_ms = 100
-# call_lock_same_tg_only = true
-#
-# [hbp]
-# hbp_mode = "PERSISTENT"
-# hbp_start_on_voice = false
-# hbp_to_ipsc_header_repeats = 3
-# hbp_to_ipsc_pacing = true
-# hbp_to_ipsc_frame_interval_ms = 60
-# hbp_to_ipsc_queue_limit = 64
